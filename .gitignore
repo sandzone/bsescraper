@@ -1,0 +1,28 @@
+ #See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+
+/docker_images
+
+# dependencies
+/node_modules
+
+# misc
+**/mobile
+/deprecated
+/src/mobile
+/db
+/db_old
+/dump
+/logs
+/dist
+/manual
+/pyServer
+/lib
+/bin
+/share
+Dockerfile
+*.zip
+*.env
+*.pem
+*.bson
+*.csv
+notesaurus.tar

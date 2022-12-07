@@ -2,6 +2,7 @@ import {promises as fs} from 'fs'
 import pdfjsLib from 'pdfjs-dist'
 import clustering from 'density-clustering'
 import levenshtein from 'fast-levenshtein'
+import axios from 'axios';
 
 //https://naturalnode.github.io/natural/brill_pos_tagger.html
 import natural from 'natural'
@@ -138,15 +139,15 @@ const mergePageTransitionBlocks = (blocks) => {
 }
 
 const markForExtraction = (blocks)  =>  {
-  let newBlocks = []
+  let newBlocks = [], id=0
   for (let i=0; i<blocks.length; i++) {
     if (hasSpeaker(blocks[i].text))  {
       const splits = blocks[i].text.split(':')
-      newBlocks.push({text:splits[0].trim(), type:'speaker', topicExtraction:false})
-      newBlocks.push({text:splits[1].trim(), type:'paragraph', topicExtraction:splits[0].toLowerCase().trim()=='moderator'?false:true})
+      newBlocks.push({id:id++, text:splits[0].trim(), type:'speaker', topicExtraction:false, pageNo:blocks[i].pageNo})
+      newBlocks.push({id:id++, text:splits[1].trim(), type:'paragraph', topicExtraction:splits[0].toLowerCase().trim()=='moderator'?false:true,  pageNo:blocks[i].pageNo})
     }
     else {
-      newBlocks.push({text:blocks[i].text, type:'paragraph', topicExtraction:true})
+      newBlocks.push({id:id++, text:blocks[i].text, type:'paragraph', topicExtraction:true})
     }
   }
 
@@ -181,7 +182,7 @@ const getBlocks = async (url, type=1) => {
         const textContent = textItems.filter(d=>d.pageNo==pageNo)
         const result = clusterText(textContent)
 
-        blocks.push(...result.filter(d=>d.text.length>0).map(d=>({...d, page:pageNo})))
+        blocks.push(...result.filter(d=>d.text.length>0).map(d=>({...d, pageNo:pageNo})))
       }
 
       let speakers = []
@@ -194,7 +195,7 @@ const getBlocks = async (url, type=1) => {
 
       //look at page transitions closely and merge blocks if new page doesn't start with a speaker
       blocks = mergePageTransitionBlocks(blocks, speakers)
-      //blocks = markForExtraction(blocks)
+      blocks = markForExtraction(blocks)
 
       //extract topics and then separate out the authors
       //separate out authors at the start of blocks
@@ -248,9 +249,22 @@ const processOneTranscript = async (file) =>  {
   const data = await fs.readFile(file)
   const loadingTask = pdfjsLib.getDocument({data:data})
   const pdf = await loadingTask.promise
+
   //console.log(pdf.numPages)
-  const blocks = await getPdf(data, 2)
-  console.log(blocks)
+  let blocks = await getPdf(data, 2)
+  //console.log(blocks.filter(d=>d.id<5))
+
+
+  const response = await axios.post('http://127.0.0.1:5000/getTopics',{blocks:blocks.filter(block=>block['topicExtraction'])})
+  const blocksWithKeywords = response.data
+
+  //console.log(blocksWithKeywords)
+  blocks = blocks.map(d=>{
+    const match = blocksWithKeywords.find(_d=>_d.id==d.id)
+    if (match)  Object.assign(d,{topics:match.topics})
+    return d
+  })
+  fs.writeFile('transcriptWithKeywords.json', JSON.stringify(blocks), 'utf8', (err, done)=>console.log('done'))
 }
 
 //getTranscriptLinks()

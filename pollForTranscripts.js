@@ -71,7 +71,7 @@ const pollForTranscripts = async () =>  {
           if (pagesLeft)  pageNo=pageNo+1
         }
       }
-      console.log(bseId)
+      
       if (links.length>0)
         fs.writeFile(`./announcements/${bseId}.json`, JSON.stringify(links), 'utf8', (err, done)=>console.log('done with '+bseId))
     }

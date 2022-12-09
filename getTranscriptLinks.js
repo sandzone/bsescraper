@@ -3,6 +3,9 @@ import pdfjsLib from 'pdfjs-dist'
 import clustering from 'density-clustering'
 import levenshtein from 'fast-levenshtein'
 import axios from 'axios';
+import {uniqueId} from 'remirror';
+import {MongoClient} from 'mongodb';
+const mongo = new MongoClient("mongodb+srv://sandzone:%40Sdkram2k@cluster0.oik2vtl.mongodb.net/nwb?retryWrites=true&w=majority");
 
 //https://naturalnode.github.io/natural/brill_pos_tagger.html
 import natural from 'natural'
@@ -216,7 +219,7 @@ const getPdf = async (fileName, type=1) =>  {
   let url = `https://www.bseindia.com/xml-data/corpfiling/AttachHis/${fileName}`
 
   return new Promise(async (resolve, reject)=>{
-    let {blocks, totalPages} = await getBlocks(type==2?fileName:url, type)
+    let {blocks, totalPages} = await getBlocks(type==1?url:fileName, type)
     if (totalPages<=2) {
       url = getLinkFromPdf(blocks)
       const op = await getBlocks(newUrl)
@@ -227,7 +230,125 @@ const getPdf = async (fileName, type=1) =>  {
   })
 }
 
-const getTranscriptLinks = async () =>  {
+
+function hasData(text)  {
+  const numberRe = new RegExp('[0-9]+')
+  return numberRe.exec(text)?true:false
+}
+
+function camelcase(topic) {
+  return topic.split(' ').map(d=>d[0].toUpperCase()+d.slice(1)).join('')
+}
+
+const toPmBlock = ({text, type='paragraph', topics, titleTopics, blockGroup, blockOffset, createdBy}) =>  {
+  let attrs = {key:uniqueId()}
+  if (type==='nHeading')  attrs = {level:1}
+  let content = []
+  topics.forEach((d,i)=>{
+    content.push({type:'mentionAtom', attrs:{createdByHandle:'', id:i, type:'topic', showIcon:'', label:camelcase(d), name:'topic'}})
+    content.push({type:'text', text:' '})
+  })
+  content.push({type:'text', text:text})
+  const textWithTopics = topics.join(' ')+' '+text
+  let date = new Date()
+  
+  return {
+   blockGroup:blockGroup,
+   blockOffset:blockOffset,
+   allTopics: [...titleTopics, ...topics.map(d=>camelcase(d[0]))],
+   blockContent: {
+     type:type,
+     attrs: attrs,
+     content: content.slice()
+   },
+   blockData: {type: 'note'},
+   hasData: hasData(text),
+   levelOneTopics:[],
+   levelThreeTopics:[],
+   levelTwoTopics:[],
+   levelZeroTopics: titleTopics.slice(),
+   text: textWithTopics,
+   updatedAt: date.toISOString(),
+   userAndBlockgroup: 'IndiaTranscripts'+blockGroup,
+   nodeOnlyTopics:topics.map(d=>camelcase(d[0])),
+   createdByHandle:'IndiaTranscripts',
+   processing: false,
+   createdBy:createdBy
+  }
+}
+
+const bseToNse = async (scrip) => {
+  const data = JSON.parse(await fs.readFile('./tickers.json'))
+  return new Promise((resolve, reject)=>{
+    resolve(data.find(d=>d.bseId===scrip)['nseId']+"_NS")
+  })
+}
+
+const processOneTranscript = async (blocks, blockGroup, ticker) =>  {
+  let titleTopics = [ticker, 'EarningsCallTranscript']
+
+  const db = mongo.db('nwb')
+  const blocksDb = db.collection('blocks')
+  const user = (await db.collection('users').find({username:'IndiaTranscripts'}).project({_id:1}).toArray())[0]['_id']
+  const date = new Date()
+  axios.post('http://127.0.0.1:5000/getTopics',{blocks:blocks.filter(block=>block['topicExtraction'])})
+        .then(response=>{
+          const blocksWithKeywords = response.data
+
+          let pmBlocks = blocks.map((block, i)=>{
+            const match = blocksWithKeywords.find(_d=>_d.id==block.id)
+            let topics = [], type = 'paragraph'
+
+            if (match)  topics=match.topics
+            if (block.type==='speaker') type='nHeading'
+
+            return toPmBlock({
+                              text:block.text,
+                              type:type,
+                              topics:topics.map(d=>d[0]),
+                              titleTopics:titleTopics,
+                              blockOffset:i+1,
+                              blockGroup:blockGroup,
+                              createdBy:user
+                            })
+          })
+
+          pmBlocks.unshift({
+            blockGroup:blockGroup,
+            blockOffset:0,
+            allTopics: titleTopics,
+            blockContent: {
+              type:'title',
+              attrs: {key:uniqueId(), createdOn:date.getTime(), createdBy:'IndiaTranscripts'},
+              content: titleTopics.map((d,i)=>({type:'mentionAtom', attrs:{createdByHandle:'', id:i, type:'topic', showIcon:i==0?'📈':'', label:d, name:'topic'}}))
+            },
+            blockData: {type: 'note'},
+            hasData: false,
+            levelOneTopics:[],
+            levelThreeTopics:[],
+            levelTwoTopics:[],
+            levelZeroTopics: titleTopics.slice(),
+            text: titleTopics.join(' '),
+            updatedAt: date.toISOString(),
+            userAndBlockgroup: 'IndiaTranscripts'+blockGroup,
+            nodeOnlyTopics:titleTopics,
+            createdByHandle:'IndiaTranscripts',
+            processing: false,
+            createdBy:user
+          })
+          //console.log(pmblocks)
+          blocksDb.insertMany(pmBlocks)
+        })
+  //fs.writeFile('transcriptWithKeywords.json', JSON.stringify(blocks), 'utf8', (err, done)=>console.log('done'))
+}
+
+const processAllTranscripts = async () =>  {
+    await mongo.connect()
+    const db = mongo.db('nwb')
+    const blocks = db.collection('blocks')
+    const user = (await db.collection('users').find({username:'IndiaTranscripts'}).project({_id:1}).toArray())[0]['_id']
+    const lastBlockGroup = (await blocks.find({createdBy:user}).sort({createdAt:-1}).limit(1).project({blockGroup:1, _id:0}).toArray())[0].blockGroup
+
     const re = new RegExp('transcript','ig')
     const files = await fs.readdir('./announcements')
     const transcriptLinks = []
@@ -239,33 +360,20 @@ const getTranscriptLinks = async () =>  {
         if (re.exec(item.HEADLINE)) {
           const newDate = new Date(item.NEWS_DT)
           const scrip = item.SCRIP_CD
-          await getPdf(item.ATTACHMENTNAME)
+          const nse_id = bseToNse(scrip)
+          processOneTranscript(await getPdf(item.ATTACHMENTNAME), blockGroup++, nse_id)
         }
       }
     }
 }
 
-const processOneTranscript = async (file) =>  {
+async function _processOneTranscript(file, blockGroup, ticker) {
+  await mongo.connect()
+  const db = mongo.db('nwb')
+  const user = (await db.collection('users').find({username:'IndiaTranscripts'}).project({_id:1}).toArray())[0]['_id']
   const data = await fs.readFile(file)
-  const loadingTask = pdfjsLib.getDocument({data:data})
-  const pdf = await loadingTask.promise
-
-  //console.log(pdf.numPages)
-  let blocks = await getPdf(data, 2)
-  //console.log(blocks.filter(d=>d.id<5))
-
-
-  const response = await axios.post('http://127.0.0.1:5000/getTopics',{blocks:blocks.filter(block=>block['topicExtraction'])})
-  const blocksWithKeywords = response.data
-
-  //console.log(blocksWithKeywords)
-  blocks = blocks.map(d=>{
-    const match = blocksWithKeywords.find(_d=>_d.id==d.id)
-    if (match)  Object.assign(d,{topics:match.topics})
-    return d
-  })
-  fs.writeFile('transcriptWithKeywords.json', JSON.stringify(blocks), 'utf8', (err, done)=>console.log('done'))
+  processOneTranscript(await getPdf(data, 2), 66, 'ABB_NS')
 }
 
-//getTranscriptLinks()
-processOneTranscript('./transcripts/d9df70d1-74ee-4e17-9ce3-f82a5046feb3.pdf')
+//processAllTranscripts()
+_processOneTranscript('./transcripts/d9df70d1-74ee-4e17-9ce3-f82a5046feb3.pdf', 2)

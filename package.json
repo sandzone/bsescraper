@@ -12,6 +12,7 @@
     "fast-csv": "^4.3.6",
     "fast-levenshtein": "^3.0.0",
     "fs": "^0.0.1-security",
+    "moment": "^2.29.4",
     "mongodb": "^4.12.1",
     "mongoose": "^6.8.0",
     "natural": "^5.2.4",

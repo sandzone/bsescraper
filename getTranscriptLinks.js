@@ -5,6 +5,7 @@ import levenshtein from 'fast-levenshtein'
 import axios from 'axios';
 import {uniqueId} from 'remirror';
 import {MongoClient} from 'mongodb';
+import moment from 'moment';
 const mongo = new MongoClient("mongodb+srv://sandzone:%40Sdkram2k@cluster0.oik2vtl.mongodb.net/nwb?retryWrites=true&w=majority");
 
 //https://naturalnode.github.io/natural/brill_pos_tagger.html
@@ -110,12 +111,12 @@ const attachRepetition = (textItems) =>  {
 }
 
 const canDelete = (item, totalPages) => {
-  const re = new RegExp(/:/ig)  //this most likely indicates a moderator
-  return !re.exec(item.text) && item.repetition>Math.floor(0.75*totalPages)
+  //const re = new RegExp(/:/ig)  //this most likely indicates a moderator
+  //if (re.exec(item.text)) console.log(item)
+  return item.repetition>Math.floor(0.75*totalPages)
 }
 
 const hasSpeaker = (text)  =>  {
-
   const splits = text.split(':')
   if (splits.length==1) return false
   const words = splits[0].split(' ')
@@ -157,9 +158,8 @@ const markForExtraction = (blocks)  =>  {
   return newBlocks
 }
 
-const getBlocks = async (url, type=1) => {
+const getBlocks = async (url, type=1, newsDt) => {
   return new Promise(async (resolve, reject)=>{
-    //const loadingTask = pdfjsLib.getDocument({data:url} //from file
     try {
       const loadingTask = type==2?pdfjsLib.getDocument({data:url}):pdfjsLib.getDocument(url)
       const pdf = await loadingTask.promise
@@ -178,10 +178,11 @@ const getBlocks = async (url, type=1) => {
           textItems.push({text:item.str, cx:x+width/2, cy:y+height/2, width:width, height:height, x1:x, y1:y, x2:x+width, y2:y+height, pageNo:pageNo})
         })
       }
+
       textItems = attachRepetition(textItems)
       textItems = textItems.filter(d=>d.repetition==0 || !canDelete(d, pdf.numPages))
 
-      for (let pageNo=2; pageNo<pdf.numPages; pageNo++) {
+      for (let pageNo=1; pageNo<pdf.numPages; pageNo++) {
         const textContent = textItems.filter(d=>d.pageNo==pageNo)
         const result = clusterText(textContent)
 
@@ -194,7 +195,8 @@ const getBlocks = async (url, type=1) => {
         if (!speakers.find(d=>d.toLowerCase()===speaker.toLowerCase()))
           speakers.push(speaker)
       })
-
+      const titlePeriod = getTitlePeriod(blocks)
+      const createdOn = getCreatedOn(blocks, newsDt)
 
       //look at page transitions closely and merge blocks if new page doesn't start with a speaker
       blocks = mergePageTransitionBlocks(blocks, speakers)
@@ -202,31 +204,31 @@ const getBlocks = async (url, type=1) => {
 
       //extract topics and then separate out the authors
       //separate out authors at the start of blocks
-
-
-      //removeRepetitiveText(pages)
-      resolve({blocks:blocks, totalPages:pdf.numPages})
+      resolve({blocks:blocks, totalPages:pdf.numPages, createdOn:createdOn, titlePeriod:titlePeriod})
     }
     catch (e) {
       console.log(e)
       console.log('link is too old')
-      resolve({blocks:[], totalPages:3})
+      resolve({blocks:[], totalPages:3, createdOn:new Date(), titlePeriod:''})
     }
   })
 }
 
-const getPdf = async (fileName, type=1) =>  {
+const getPdf = async (fileName, type=1, newsDt) =>  {
   let url = `https://www.bseindia.com/xml-data/corpfiling/AttachHis/${fileName}`
 
   return new Promise(async (resolve, reject)=>{
-    let {blocks, totalPages} = await getBlocks(type==1?url:fileName, type)
+    let {blocks, totalPages, createdOn, titlePeriod} = await getBlocks(type==1?url:fileName, type, newsDt)
     if (totalPages<=2) {
       url = getLinkFromPdf(blocks)
-      const op = await getBlocks(newUrl)
+      const op = await getBlocks(url, 1, newsDt)
       blocks = op.blocks
       totalPages = op.totalPages
+      createdOn = op.createdOn
+      titlePeriod = op.titlePeriod
     }
-    resolve(blocks)
+
+    resolve([blocks, titlePeriod, createdOn])
   })
 }
 
@@ -237,25 +239,27 @@ function hasData(text)  {
 }
 
 function camelcase(topic) {
+  console.log(topic)
+  console.log(topic.split(' '))
   return topic.split(' ').map(d=>d[0].toUpperCase()+d.slice(1)).join('')
 }
 
-const toPmBlock = ({text, type='paragraph', topics, titleTopics, blockGroup, blockOffset, createdBy}) =>  {
+const toPmBlock = ({text, type='paragraph', topics, titleTopics, blockGroup, blockOffset, createdBy, createdOn}) =>  {
   let attrs = {key:uniqueId()}
-  if (type==='nHeading')  attrs = {level:1}
+  if (type==='nHeading')  Object.assign(attrs,{level:1})
   let content = []
   topics.forEach((d,i)=>{
-    content.push({type:'mentionAtom', attrs:{createdByHandle:'', id:i, type:'topic', showIcon:'', label:camelcase(d), name:'topic'}})
+    content.push({type:'mentionAtom', attrs:{createdByHandle:'', id:i, type:'topic', showIcon:'', label:d, name:'topic'}})
     content.push({type:'text', text:' '})
   })
   content.push({type:'text', text:text})
   const textWithTopics = topics.join(' ')+' '+text
   let date = new Date()
-  
+
   return {
    blockGroup:blockGroup,
    blockOffset:blockOffset,
-   allTopics: [...titleTopics, ...topics.map(d=>camelcase(d[0]))],
+   allTopics: [...titleTopics, ...topics],
    blockContent: {
      type:type,
      attrs: attrs,
@@ -268,112 +272,203 @@ const toPmBlock = ({text, type='paragraph', topics, titleTopics, blockGroup, blo
    levelTwoTopics:[],
    levelZeroTopics: titleTopics.slice(),
    text: textWithTopics,
-   updatedAt: date.toISOString(),
+   updatedAt: date,
    userAndBlockgroup: 'IndiaTranscripts'+blockGroup,
-   nodeOnlyTopics:topics.map(d=>camelcase(d[0])),
+   nodeOnlyTopics:topics.slice(),
    createdByHandle:'IndiaTranscripts',
    processing: false,
-   createdBy:createdBy
+   createdBy:createdBy,
+   createdOn:createdOn,
+   lastSaveBy:createdBy
   }
 }
 
 const bseToNse = async (scrip) => {
   const data = JSON.parse(await fs.readFile('./tickers.json'))
   return new Promise((resolve, reject)=>{
-    resolve(data.find(d=>d.bseId===scrip)['nseId']+"_NS")
+    const match = data.find(d=>d.bseId===scrip)
+    if (match)  resolve(match['nseId']+"_NS")
+    resolve(scrip+"_BS")
   })
 }
 
-const processOneTranscript = async (blocks, blockGroup, ticker) =>  {
-  let titleTopics = [ticker, 'EarningsCallTranscript']
+function processDate({type, value}) {
+  if (type==='year')  {
+    return value.replaceAll(' ','').toUpperCase()
+  }
 
-  const db = mongo.db('nwb')
-  const blocksDb = db.collection('blocks')
-  const user = (await db.collection('users').find({username:'IndiaTranscripts'}).project({_id:1}).toArray())[0]['_id']
-  const date = new Date()
-  axios.post('http://127.0.0.1:5000/getTopics',{blocks:blocks.filter(block=>block['topicExtraction'])})
-        .then(response=>{
-          const blocksWithKeywords = response.data
-
-          let pmBlocks = blocks.map((block, i)=>{
-            const match = blocksWithKeywords.find(_d=>_d.id==block.id)
-            let topics = [], type = 'paragraph'
-
-            if (match)  topics=match.topics
-            if (block.type==='speaker') type='nHeading'
-
-            return toPmBlock({
-                              text:block.text,
-                              type:type,
-                              topics:topics.map(d=>d[0]),
-                              titleTopics:titleTopics,
-                              blockOffset:i+1,
-                              blockGroup:blockGroup,
-                              createdBy:user
-                            })
-          })
-
-          pmBlocks.unshift({
-            blockGroup:blockGroup,
-            blockOffset:0,
-            allTopics: titleTopics,
-            blockContent: {
-              type:'title',
-              attrs: {key:uniqueId(), createdOn:date.getTime(), createdBy:'IndiaTranscripts'},
-              content: titleTopics.map((d,i)=>({type:'mentionAtom', attrs:{createdByHandle:'', id:i, type:'topic', showIcon:i==0?'📈':'', label:d, name:'topic'}}))
-            },
-            blockData: {type: 'note'},
-            hasData: false,
-            levelOneTopics:[],
-            levelThreeTopics:[],
-            levelTwoTopics:[],
-            levelZeroTopics: titleTopics.slice(),
-            text: titleTopics.join(' '),
-            updatedAt: date.toISOString(),
-            userAndBlockgroup: 'IndiaTranscripts'+blockGroup,
-            nodeOnlyTopics:titleTopics,
-            createdByHandle:'IndiaTranscripts',
-            processing: false,
-            createdBy:user
-          })
-          //console.log(pmblocks)
-          blocksDb.insertMany(pmBlocks)
-        })
-  //fs.writeFile('transcriptWithKeywords.json', JSON.stringify(blocks), 'utf8', (err, done)=>console.log('done'))
+  if (type==='quarterOrHalf') {
+    const numRe = new RegExp('\\d')
+    const textRe = new RegExp('q|h', 'ig')
+    const numMatch = numRe.exec(value)
+    const textMatch = textRe.exec(value)
+    return numMatch[0]+textMatch[0].toUpperCase()
+  }
 }
+
+function getTitlePeriod(blocks) {
+  const re = new RegExp('((\\d\\s*[q|h])|([q|h]\\s*\\d))\\s*([a-zA-Z\\s]*((\\d\\s*\\d)|(\\d\\s*\\d\\s*\\d\\s*\\d)))\\s*earnings conference call','ig')
+  let titlePeriod = ''
+
+  for (let i=0; i<blocks.length; i++)  {
+    const block = blocks[i]
+
+    const match = re.exec(block.text)
+
+    if (match)  {
+      const titlePeriod_1 = processDate({type:'quarterOrHalf', value:match[1]})
+      const titlePeriod_2 = processDate({type:'year', value:match[4]})
+      titlePeriod=titlePeriod_1+titlePeriod_2
+      break
+    }
+  }
+
+  return titlePeriod
+}
+
+function getCreatedOn(blocks, nseDt) {
+  const re = new RegExp('(january|february|march|april|may|june|july|august|september|october|november|december)\\s*(\\d+),\\s*(\\d{2,4})','ig')
+  let createdOn = []//store all possible matches and their frequencies
+
+  for (let i=0; i<blocks.length; i++)  {
+    const block = blocks[i]
+    const match = re.exec(block.text)
+    if (match)  {
+      const dt = moment(match[0],'MMMM D, YYYY').toDate()
+      const existingIdx = createdOn.findIndex(d=>d.dt===dt)
+      if (existingIdx==-1) createdOn.push({dt:dt, frq:1})
+      else createdOn[existingIdx].frq=createdOn[existingIdx].frq+1
+    }
+  }
+
+  if (createdOn.length>0) return createdOn.sort((a,b)=>a.frq-b.frq).pop().dt
+  return nseDt
+}
+
+const processOneTranscript = async (blocks, titlePeriod, createdOn, blockGroup, ticker) =>  {
+  return new Promise(async (resolve, reject)=>{
+    if (blocks.length==0) resolve('none');
+    let titleTopics = [ticker, titlePeriod, 'EarningsCallTranscript'].filter(d=>d.length>0).map(d=>camelcase(d))
+
+    const db = mongo.db('nwb')
+    const blocksDb = db.collection('blocks')
+    const user = (await db.collection('users').find({username:'IndiaTranscripts'}).project({_id:1}).toArray())[0]['_id']
+    const date = new Date()
+    axios.post('http://127.0.0.1:5000/getTopics',{blocks:blocks.filter(block=>block['topicExtraction'])})
+          .then(response=>{
+            const blocksWithKeywords = response.data
+
+            let pmBlocks = blocks.map((block, i)=>{
+              const match = blocksWithKeywords.find(_d=>_d.id==block.id)
+              let topics = [], type = 'paragraph'
+
+              if (match)  {
+                console.log(match)
+                topics=match.topics.filter(d=>d.length>0).map(d=>camelcase(d[0]))
+              }
+              if (block.type==='speaker') type='nHeading'
+
+              return toPmBlock({
+                                text:block.text,
+                                type:type,
+                                topics:topics,
+                                titleTopics:titleTopics,
+                                blockOffset:i+1,
+                                blockGroup:blockGroup,
+                                createdBy:user,
+                                createdOn:createdOn
+                              })
+            })
+
+            let titleContent = []
+            titleTopics.forEach((d,i)=>{
+              let showIcon = ''
+              if (i==0) showIcon='📈'
+              titleContent.push({type:'mentionAtom', attrs:{createdByHandle:'', id:i, type:'topic', showIcon:i==0?'📈':'', label:d, name:'topic'}})
+              titleContent.push({type:'text', text:' '})
+
+            })
+
+            pmBlocks.unshift({
+              blockGroup:blockGroup,
+              blockOffset:0,
+              allTopics: titleTopics,
+              blockContent: {
+                type:'title',
+                attrs: {key:uniqueId(), createdOn:date.getTime(), createdBy:'IndiaTranscripts'},
+                content: titleContent
+              },
+              blockData: {type: 'note'},
+              hasData: false,
+              levelOneTopics:[],
+              levelThreeTopics:[],
+              levelTwoTopics:[],
+              levelZeroTopics: titleTopics.slice(),
+              text: titleTopics.join(' '),
+              updatedAt: date,
+              userAndBlockgroup: 'IndiaTranscripts'+blockGroup,
+              nodeOnlyTopics:titleTopics,
+              createdByHandle:'IndiaTranscripts',
+              processing: false,
+              createdBy:user,
+              createdOn:createdOn,
+              lastSaveBy:user
+            })
+            //console.log(pmblocks)
+            blocksDb.insertMany(pmBlocks).then((response)=>console.log(response))
+            resolve('none')
+          })
+      reject('none')
+  })
+
+  //fs.writeFile('transcriptWithKeywords.json', JSON.stringify(blocks), 'utf8', (err, done)=>console.log('done'))
+
+}
+
+
 
 const processAllTranscripts = async () =>  {
     await mongo.connect()
     const db = mongo.db('nwb')
     const blocks = db.collection('blocks')
     const user = (await db.collection('users').find({username:'IndiaTranscripts'}).project({_id:1}).toArray())[0]['_id']
-    const lastBlockGroup = (await blocks.find({createdBy:user}).sort({createdAt:-1}).limit(1).project({blockGroup:1, _id:0}).toArray())[0].blockGroup
+    let blockGroup = await blocks.find({createdBy:user}).sort({createdAt:-1}).limit(1).project({blockGroup:1, _id:0}).toArray()
+    if (blockGroup.length==0) blockGroup = 1
+    else blockGroup=blockGroup+1
 
     const re = new RegExp('transcript','ig')
     const files = await fs.readdir('./announcements')
     const transcriptLinks = []
     for (let i=0; i<files.length; i++)  {
+
       const file = files[i]
+      console.log("Processing "+file)
       const data = JSON.parse(await fs.readFile(`./announcements/${file}`, 'utf8'))
       for (let j=0; j<data.length; j++) {
         const item = data[j]
         if (re.exec(item.HEADLINE)) {
-          const newDate = new Date(item.NEWS_DT)
+          const newsDate = new Date(item.NEWS_DT)
           const scrip = item.SCRIP_CD
-          const nse_id = bseToNse(scrip)
-          processOneTranscript(await getPdf(item.ATTACHMENTNAME), blockGroup++, nse_id)
+          const nse_id = await bseToNse(scrip)
+          console.log("Processing "+item.ATTACHMENTNAME)
+          await processOneTranscript(...await getPdf(item.ATTACHMENTNAME, 1, newsDate), blockGroup++, nse_id)
+          console.log('finished')
         }
       }
     }
 }
+
+
 
 async function _processOneTranscript(file, blockGroup, ticker) {
   await mongo.connect()
   const db = mongo.db('nwb')
   const user = (await db.collection('users').find({username:'IndiaTranscripts'}).project({_id:1}).toArray())[0]['_id']
   const data = await fs.readFile(file)
-  processOneTranscript(await getPdf(data, 2), 66, 'ABB_NS')
+
+  processOneTranscript(...await getPdf(data, 2, new Date()), 66, 'ABB_NS')
 }
 
-//processAllTranscripts()
-_processOneTranscript('./transcripts/d9df70d1-74ee-4e17-9ce3-f82a5046feb3.pdf', 2)
+processAllTranscripts()
+//_processOneTranscript('./transcripts/d9df70d1-74ee-4e17-9ce3-f82a5046feb3.pdf', 2)
+//_processOneTranscript('./transcripts/tcs_2q.pdf', 2)

@@ -20,7 +20,7 @@ import re
 model = SentenceTransformer('distilbert-base-nli-mean-tokens', device='cpu')
 vectorizer = KeyphraseCountVectorizer()
 stemmer = PorterStemmer()
-pattern = re.compile('[0-9%]+')
+patternPct = re.compile('[0-9%]+')
 
 app = Flask(__name__)
 
@@ -77,26 +77,37 @@ def standardiseTopics(topics):
 def getIgnoreList():
     with open("./ignoreList.csv", 'r') as file:
         csv_reader = csv.reader(file)
-        ignoreList = [stemmer.stem(row[0]) if len(word_tokenize(row[0]))==1 else row[0] for row in csv_reader]
+        #only compare stemmed versions
+        ignoreList = []
+        for row in csv_reader:
+            ignoreList.append(' '.join([stemmer.stem(word) for word in word_tokenize(row[0])]))
         return ignoreList
 
-def allOkayToAdd(phrase, ignoreList):
-    if len(word_tokenize(phrase))>3:
+def getIgnorePatterns():
+    with open("./ignorePatternList.csv", 'r') as file:
+        csv_reader = csv.reader(file)
+        #making a flat list of all ignore pattern tokens... ignorePattern basically means a very aggressive delete criterion
+        ignorePattern = [stemmer.stem(word) for row in csv_reader for word in word_tokenize(row[0])]
+        return ignorePattern
+
+def allOkayToAdd(phrase, ignoreList, ignorePattern):
+    stemmed_tokens = [stemmer.stem(word) for word in word_tokenize(phrase)]
+    stemmed_phrase = ' '.join(stemmed_tokens)
+
+    if len(phrase)<2:#single letter words
         return False
 
-    if len(pattern.findall(phrase))>0:
+    if len(patternPct.findall(phrase))>0:
         return False
 
-    for ignoreWord in ignoreList:
-        n = len(ignoreWord.split(' '))
-        checkWords = [' '.join(ngram).lower() for ngram in ngrams(word_tokenize(phrase), n)]
-        for checkWord in checkWords:
-            if checkWord==ignoreWord:
-                return False
+    if len(stemmed_tokens)>3:#cut out really long phrases
+        return False
 
-    for token in phrase.split(' '):
-        stemmedToken = stemmer.stem(token)
-        if stemmedToken in ignoreList:
+    if stemmed_phrase in ignoreList:#ignore list is already stemmed
+        return False
+
+    for stemmed_token in stemmed_tokens:
+        if stemmed_token in ignorePattern:
             return False
 
     return True
@@ -159,7 +170,8 @@ def mss(doc_embedding, candidates, candidate_embeddings):
 #topics=[{id:, topics:}]
 def combineSimilarTopics(docs, topic_data):
     all_topics = np.unique([topic[0] for row in topic_data for topic in row['topics']])
-
+    if len(all_topics)==0:
+        return []
     topic_lengths = [len(word_tokenize(topic)) for topic in all_topics]
     topic_count_vectorizer = CountVectorizer(ngram_range=(min(topic_lengths), max(topic_lengths)), vocabulary=all_topics)
     topic_counts = topic_count_vectorizer.fit_transform(docs).toarray()
@@ -193,12 +205,11 @@ def combineSimilarTopics(docs, topic_data):
             no_clusters = all_topics[similar_idx]
 
     return outputs
-    #[{inputs:output}]
-
 
 @app.route('/getTopics', methods=['POST'])
 def getTopics():
     ignoreList = getIgnoreList()
+    ignorePattern = getIgnorePatterns()
     data = request.get_json()
     print ('got request')
     '''
@@ -213,9 +224,9 @@ def getTopics():
     if (len(docs)==0):
         return []
     vectorizer.fit_transform(docs)
-    #this gets keywords out of the whole document
 
-    all_candidates = np.array([phrase for phrase in vectorizer.get_feature_names_out() if allOkayToAdd(phrase, ignoreList)])
+    #this gets keywords out of the whole document
+    all_candidates = np.array([phrase for phrase in vectorizer.get_feature_names_out() if allOkayToAdd(phrase, ignoreList, ignorePattern)])
     doc_embeddings = model.encode(docs)
     all_candidate_embeddings = model.encode(all_candidates)
     topics = []

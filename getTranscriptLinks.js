@@ -5,7 +5,6 @@ import levenshtein from 'fast-levenshtein'
 import axios from 'axios';
 import {uniqueId} from 'remirror';
 import {MongoClient} from 'mongodb';
-import moment from 'moment';
 const mongo = new MongoClient("mongodb+srv://sandzone:%40Sdkram2k@cluster0.oik2vtl.mongodb.net/nwb?retryWrites=true&w=majority");
 
 //https://naturalnode.github.io/natural/brill_pos_tagger.html
@@ -177,7 +176,7 @@ const getBlocks = async (url, type=1, newsDt) => {
       const pdf = await loadingTask.promise
       let blocks = [], textItems = [];
 
-      for (let pageNo=2; pageNo<pdf.numPages; pageNo++) {
+      for (let pageNo=2; pageNo<=pdf.numPages; pageNo++) {
         const page = await pdf.getPage(pageNo)
         const textContent = await page.getTextContent()
 
@@ -194,7 +193,7 @@ const getBlocks = async (url, type=1, newsDt) => {
       textItems = attachRepetition(textItems)
       textItems = textItems.filter(d=>d.repetition==0 || !canDelete(d, pdf.numPages))
 
-      for (let pageNo=2; pageNo<pdf.numPages; pageNo++) {
+      for (let pageNo=2; pageNo<=pdf.numPages; pageNo++) {
         const textContent = textItems.filter(d=>d.pageNo==pageNo)
         const result = clusterText(textContent)
 
@@ -207,7 +206,7 @@ const getBlocks = async (url, type=1, newsDt) => {
         if (!speakers.find(d=>d.toLowerCase()===speaker.toLowerCase()))
           speakers.push(speaker)
       })
-      const titlePeriod = getTitlePeriod(blocks)
+      const titlePeriod = getTitlePeriod(blocks, newsDt)
       const createdOn = getCreatedOn(blocks, newsDt)
 
       //look at page transitions closely and merge blocks if new page doesn't start with a speaker
@@ -216,7 +215,7 @@ const getBlocks = async (url, type=1, newsDt) => {
 
       //extract topics and then separate out the authors
       //separate out authors at the start of blocks
-      resolve({blocks:blocks, totalPages:pdf.numPages, createdOn:createdOn, titlePeriod:titlePeriod})
+      resolve({blocks:blocks.filter(block=>block.text.length!=0), totalPages:pdf.numPages, createdOn:createdOn, titlePeriod:titlePeriod})
     }
     catch (e) {
       //console.log(e)
@@ -227,7 +226,6 @@ const getBlocks = async (url, type=1, newsDt) => {
 
 const getPdf = async (fileName, type=1, newsDt) =>  {
   let url = `https://www.bseindia.com/xml-data/corpfiling/AttachHis/${fileName}`
-
   return new Promise(async (resolve, reject)=>{
     try {
       let {blocks, totalPages, createdOn, titlePeriod} = await getBlocks(type==1?url:fileName, type, newsDt)
@@ -239,7 +237,7 @@ const getPdf = async (fileName, type=1, newsDt) =>  {
         createdOn = op.createdOn
         titlePeriod = op.titlePeriod
       }
-
+      console.log(blocks)
       resolve([blocks, titlePeriod, createdOn, url])
     }
     catch (e) {
@@ -306,49 +304,82 @@ const bseToNse = async (scrip) => {
   })
 }
 
-function processDate({type, value}) {
-  if (type==='year')  {
-    return value.replaceAll(' ','').toUpperCase()
-  }
+const conference_call = "(earnings|results)\\s*conference\\s*call\\s*(transcript)?"
+const year = "(?<year>(\\d{4}|\\d{2})|((?<fcy>(f|c)y)(’|-|')?\\s*(\\d{4}|\\d{2})))" //numbers or fy or cy followed by ' - \\s
+const quarter = "(?<quarter>([1-4]\\s*q)|(q\\s*[1-4]))?"
+const half = "(?<half>([1-4]\\s*h)|(h\\s*[1-4]\\s))?"
+const nonHalf = "(&\\s*[a-z|\\s]{1,20})?" // to capture things like q3 and nine months etc.
 
-  if (type==='quarterOrHalf') {
-    const numRe = new RegExp('\\d')
-    const textRe = new RegExp('q|h', 'ig')
-    const numMatch = numRe.exec(value)
-    const textMatch = textRe.exec(value)
-    return numMatch[0]+textMatch[0].toUpperCase()
-  }
+const months = '('+['january','february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'].join('|')+')'
+const mmmm_dd_yyyy_string = '(?<date>'+months+'\\s*([1-9]|[12][0-9]|3[01])\\s*,?\\s*(\\d{4}|\\d{2}))'
+//https://www.regextutorial.org/regex-for-numbers-and-ranges.php
+const patternTwo = '('+conference_call+'\\s*'+mmmm_dd_yyyy_string+')'
+const patternOne = '('+quarter+'\\s*&?\\s*'+half+'\\s*'+nonHalf+'\\s*'+year+'\\s*'+conference_call+')'
+
+const date_regex = new RegExp(patternOne+'|'+patternTwo,'ig')
+
+function getYear(year)  {
+  if (year>100 && year<2000) year = year%1900
+  if (year>100 && year>=2000) year = year%2000
+  if (year<10) year = '0'+year.toString()
+  else year = year.toString()
+  return year
 }
 
-function getTitlePeriod(blocks) {
-  const re = new RegExp('((\\d\\s*[q|h])|([q|h]\\s*\\d))\\s*([a-zA-Z\\s]*((\\d\\s*\\d)|(\\d\\s*\\d\\s*\\d\\s*\\d)))\\s*(earnings conference call|results conference call)','ig')
-  let titlePeriod = ''
+function getLastQuarter(dt) {
+  let month = dt.getMonth()+1,
+      day = dt.getDate(),
+      year = ((month-3)<=0?dt.getFullYear()-1:dt.getFullYear()),
+      prvQuarter = Math.ceil(((month-3)<=0?12:(month-3))/3);
+
+  return prvQuarter.toString()+'QCY'+getYear(year)
+}
+
+function getTranscriptDate(date_string) {
+  const match = date_regex.exec(date_string)
+  let quarter = '', year = '';
+  date_regex.lastIndex = 0;
+  if (match) {
+    if (match.groups.quarter && match.groups.year) {
+      quarter = new RegExp('\\d+','ig').exec(match.groups.quarter)[0]
+      year = getYear(parseInt(new RegExp('\\d+','ig').exec(match.groups.year)[0]))
+      return quarter+"Q"+match.groups.fcy+year
+    }
+
+    if (match.groups.half && match.groups.year) {
+      half = new RegExp('\\d+','ig').exec(match.groups.half)[0]
+      year = getYear(parseInt(new RegExp('\\d+','ig').exec(match.groups.year)[0]))
+      return half+"H"+match.groups.fcy+year
+    }
+
+    if (match.groups.date)  {
+      return getLastQuarter(new Date(Date.parse(match.groups.date)))
+    }
+  }
+  else
+    return null
+}
+
+function getTitlePeriod(blocks, newsDt) {
+  let titlePeriod = getLastQuarter(newsDt)
 
   for (let i=0; i<blocks.length; i++)  {
-    const block = blocks[i]
-
-    const match = re.exec(block.text)
-
-    if (match)  {
-      const titlePeriod_1 = processDate({type:'quarterOrHalf', value:match[1]})
-      const titlePeriod_2 = processDate({type:'year', value:match[4]})
-      titlePeriod=titlePeriod_1+titlePeriod_2
-      break
-    }
+    let dtPeriod = getTranscriptDate(blocks[i.text])
+    if (!!dtPeriod) titlePeriod = dtPeriod
   }
 
   return titlePeriod
 }
 
-function getCreatedOn(blocks, nseDt) {
-  const re = new RegExp('(january|february|march|april|may|june|july|august|september|october|november|december)\\s*(\\d+),\\s*(\\d{2,4})','ig')
+function getCreatedOn(blocks, newsDt) {
+  const re = new RegExp('mmmm_dd_yyyy_string','ig')
   let createdOn = []//store all possible matches and their frequencies
 
   for (let i=0; i<blocks.length; i++)  {
     const block = blocks[i]
     const match = re.exec(block.text)
     if (match)  {
-      const dt = moment(match[0],'MMMM D, YYYY').toDate()
+      const dt = new Date(Date.parse(match.groups.date))
       const existingIdx = createdOn.findIndex(d=>d.dt===dt)
       if (existingIdx==-1) createdOn.push({dt:dt, frq:1})
       else createdOn[existingIdx].frq=createdOn[existingIdx].frq+1
@@ -356,18 +387,38 @@ function getCreatedOn(blocks, nseDt) {
   }
 
   if (createdOn.length>0) return createdOn.sort((a,b)=>a.frq-b.frq).pop().dt
-  return nseDt
+  return newsDt
 }
 
-function getSourceBlock(blockGroup, titleTopics, createdBy, createdOn, source)  {
+
+function getSourceBlock(blockGroup, titleTopics, createdBy, createdOn, url)  {
     return {
      blockGroup:blockGroup,
      blockOffset:1,
      allTopics: titleTopics.slice(),
      blockContent: {
-       type:type,
-       attrs: attrs,
-       content: content.slice()
+       type: "paragraph",
+       attrs: {key: uniqueId()},
+       content: [
+         {
+           type: "text",
+           marks: [
+             {
+               type: "nLink",
+               attrs: {
+                 'data-fileandlink': [
+                   {
+                     type: "link",
+                     location: url,
+                   }
+                 ],
+                 "data-subtext": "Link"
+               }
+             }
+           ],
+           text: "Source file"
+         }
+       ]
      },
      blockData: {type: 'note'},
      hasData: false,
@@ -375,20 +426,20 @@ function getSourceBlock(blockGroup, titleTopics, createdBy, createdOn, source)  
      levelThreeTopics:[],
      levelTwoTopics:[],
      levelZeroTopics: titleTopics.slice(),
-     text: textWithTopics,
+     text: "Source file",
      updatedAt: new Date(),
      userAndBlockgroup: 'IndiaTranscripts'+blockGroup,
      nodeOnlyTopics:[],
      createdByHandle:'IndiaTranscripts',
      processing: false,
      createdBy:createdBy,
-     createdOn:createdOn,
+     createdAt:createdOn,
      lastSaveBy:createdBy
     }
-  }
 }
 
 const processOneTranscript = async (blocks, titlePeriod, createdOn, url, blockGroup, ticker) =>  {
+
   return new Promise(async (resolve, reject)=>{
     if (blocks.length==0) reject('none');
     let titleTopics = [ticker, titlePeriod, 'EarningsCallTranscript'].filter(d=>d.length>0).map(d=>camelcase(d))
@@ -397,9 +448,7 @@ const processOneTranscript = async (blocks, titlePeriod, createdOn, url, blockGr
     const blocksDb = db.collection('blocks')
     const user = (await db.collection('users').find({username:'IndiaTranscripts'}).project({_id:1}).toArray())[0]['_id']
     const date = new Date()
-
     const response = await axios.post('http://127.0.0.1:5000/getTopics',{blocks:blocks.filter(block=>block['topicExtraction'])})
-
     const blocksWithKeywords = response.data
     let pmBlocks = blocks.map((block, i)=>{
       const match = blocksWithKeywords.find(_d=>_d.id==block.id)
@@ -418,7 +467,7 @@ const processOneTranscript = async (blocks, titlePeriod, createdOn, url, blockGr
                         blockOffset:i+2,  //reserved for source block and title block
                         blockGroup:blockGroup,
                         createdBy:user,
-                        createdOn:createdOn
+                        createdAt:createdOn
                       })
     })
 
@@ -520,7 +569,7 @@ async function _processOneTranscript(file, blockGroup, ticker) {
   const user = (await db.collection('users').find({username:'IndiaTranscripts'}).project({_id:1}).toArray())[0]['_id']
   const data = await fs.readFile(file)
   try {
-    processOneTranscript(...await getPdf(data, 2, new Date()), 66, 'ABB_NS')
+    processOneTranscript(...await getPdf(data, 2, new Date()), blockGroup, 'ABB_NS')
   } catch (e) {
     console.log(e)
   }
@@ -529,4 +578,4 @@ async function _processOneTranscript(file, blockGroup, ticker) {
 
 processAllTranscripts()
 //_processOneTranscript('./transcripts/d9df70d1-74ee-4e17-9ce3-f82a5046feb3.pdf', 2)
-//_processOneTranscript('./transcripts/tcs_2q.pdf', 2)
+//_processOneTranscript('./transcripts/benaras_beads.pdf', 667)

@@ -290,7 +290,7 @@ const toPmBlock = ({text, type='paragraph', topics, titleTopics, blockGroup, blo
    createdByHandle:'IndiaTranscripts',
    processing: false,
    createdBy:createdBy,
-   createdOn:createdOn,
+   createdAt:createdOn,
    lastSaveBy:createdBy
   }
 }
@@ -503,7 +503,7 @@ const processOneTranscript = async (blocks, titlePeriod, createdOn, url, blockGr
       createdByHandle:'IndiaTranscripts',
       processing: false,
       createdBy:user,
-      createdOn:createdOn,
+      createdAt:createdOn,
       lastSaveBy:user
     })
     blocksDb.insertMany(pmBlocks).then((response)=>console.log(response))
